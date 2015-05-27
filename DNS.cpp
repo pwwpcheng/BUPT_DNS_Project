@@ -1,55 +1,74 @@
 #include "MainHeader.h"
 #include "ReplyDNSResult.h"
 
+#define THREADDEBUG std::cout << "[Thread " << t_id << "]: "
+
 const int SIP_UDP_CONNRESET = -1744830452;
-
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR,12)
-
-using namespace std;
+#define TOPORT(i) i + 15000
 
 host_item *hosts_list[MAX_HOST_ITEM];
-int host_counter = 0;
-u_short id_list[0x1000];
-SOCKET upper_dns_socket;
+cached_item *cached_list[MAX_HOST_ITEM];
+ReqPool *request_pool = new ReqPool[MAX_REQ];
+std::mutex id_mutex, pool_mutex, req_counter_mutex;
+extern std::mutex cache_mutex;
+int req_counter = 0, host_counter = 0, cached_counter = 0;
  
 int main()
 {
+	// Initialize, load history data
 	int iResult = 0;
-	iResult = startWSA();
-	loadHosts();
+	int thread_num = 0;
+
+	iResult = startWSA(); 
+	loadHosts();            // 是什么host?
 	
+	// Initialize, create listen socket
 	SOCKET listen_socket;
-	iResult = startDNSServer(&listen_socket);				//Start Server
-	if (iResult == 1) return 255;
-	iResult = connectToUpperDNS(&upper_dns_socket);				//Prepare connection to upper DNS
-	if (iResult == 1) return 255;
+	iResult = startDNSServer(&listen_socket);					
+	if (iResult == 1) return 255;  // 255 是什么错？
 
-	//Create profile(sockaddr) for topper DNS
-	struct sockaddr_in servaddr;
-	ZeroMemory(&servaddr, sizeof(servaddr));
-	servaddr.sin_family = AF_INET;
-	servaddr.sin_port = htons(DNS_PORT);
-	inet_pton(AF_INET, UPPER_DNS, &servaddr.sin_addr);
+	// Initialize Cache
+	for(int i = 0; i < MAX_CACHED_ITEM; i++)
+	{	
+		cached_list[i] = new cached_item;
+		cached_list[i]->occupied = false;
+		cached_list[i]->ttl = 0;
+		cached_list[i]->webaddr = new char[256];
+	}
 
-	char *ret_ptr = NULL, *recvbuf, *sendbuf, *dnsbuf;
-	int recvbuflen = DEFAULT_BUFLEN, sendbuflen = DEFAULT_BUFLEN;
-	recvbuf = (char*)malloc(recvbuflen * sizeof(char));
-	sendbuf = (char*)malloc(recvbuflen * sizeof(char));
-	dnsbuf  = (char*)malloc(recvbuflen * sizeof(char));
+	// Initialize DNSRequest Pool
+	for(int i = 0; i < MAX_REQ; i++)
+	{
+		request_pool[i].available = true;
+	}
+
+	std::thread dns_consulting_threads1(DNSHandleThread, "10.3.9.4", listen_socket, 1);
+	std::thread dns_consulting_threads2(DNSHandleThread, "101.226.4.6", listen_socket, 2);
+	std::thread dns_consulting_threads3(DNSHandleThread, "10.3.9.5", listen_socket, 3);
+	std::thread dns_consulting_threads4(DNSHandleThread, "10.3.9.6", listen_socket, 4);
+	std::thread cache_thread(flushDnsCacheThread);
+	std::thread pool_flush_thread(flushDNSRequestThread);
+
+	std::cout << "Initialize Complete. " << std::endl;
+
 	do
 	{
+		char *ret_ptr = NULL, *recvbuf = NULL;
+		int recvbuflen = DEFAULT_BUFLEN, sendbuflen = DEFAULT_BUFLEN;
+		recvbuf = (char*)malloc(recvbuflen * sizeof(char));
+
 		struct sockaddr_in clientaddr;
 		int client_addr_len = sizeof(clientaddr);
 		memset(recvbuf, '\0', sizeof(recvbuf));
 		ZeroMemory(&clientaddr, sizeof(clientaddr));
 
-		
 		DWORD dwBytesReturned = 0;
 		BOOL bNewBehavior = FALSE;
 		DWORD status;
 
-		// disable  new behavior using
-		// IOCTL: SIO_UDP_CONNRESET
+		 //disable  new behavior using
+		 //IOCTL: SIO_UDP_CONNRESET
 		status = WSAIoctl(listen_socket, SIO_UDP_CONNRESET,
 			&bNewBehavior, sizeof(bNewBehavior),
 			NULL, 0, &dwBytesReturned,
@@ -61,127 +80,42 @@ int main()
 			if (WSAEWOULDBLOCK == dwErr)
 			{
 				// nothing to do
-				return(FALSE);
+				return 255;
 			}
 			else
 			{
 				//cout << "WSAIoctl(SIO_UDP_CONNRESET) Error: " << dwErr << endl;
-				return(FALSE);
+				return 255;
 			}
 		}
 
-
-		char *cur_pointer;
-		//cout << "Waiting for data" << endl;
+		// Receive DNS Requests
 		iResult = recvfrom(listen_socket, recvbuf, recvbuflen, 0, (struct sockaddr*)&clientaddr, &client_addr_len);
-		//iResult = recv(listen_socket, recvbuf, recvbuflen, 0);
 		if (iResult == SOCKET_ERROR) {
-			printf("recvfrom_client() error with code: %d\n", WSAGetLastError());
+			printf("[MainProc]: recvfrom_client() error with code: %d\n", WSAGetLastError());
 			break;
 		}
 		else{
-			printf("Bytes received: %d\n", iResult);
-			printf("Received Data: %s\n", recvbuf);
+			printf("[MainProc]: Bytes received: %d\n", iResult);
+			DNSRequest *new_req = new DNSRequest;
+			new_req->client_addr = clientaddr;
+			new_req->client_addr_len = client_addr_len;
+			new_req->packet = unpackDNSPacket(recvbuf);
+			new_req->served = false;
+			new_req->ttl = 600;
+			iResult = addDNSRequestPool(new_req);
+			if(iResult == MAX_REQ + 1)
+				std::cout << "[MainProc]: Too many requests. Ignore current one.";
 		}
-		cur_pointer = recvbuf;
 
-		DNSPacket *recv_packet = unpackDNSPacket(cur_pointer);
-		UINT32 ip_addr = 0;
-		int wait_count = 0;
-		WEBADDR_TYPE addr_type = getWebAddrType(recv_packet->p_qpointer->q_qname, &ip_addr);
-		//cout << "ADDR Type : " << addr_type << endl;
-		
-		//addr_type = ADDR_NOT_FOUND;
-		switch((int)addr_type)
-		{
-		case ADDR_BLOCKED :
-			{
-				DNSPacket *result_packet = getDNSResult(recv_packet, ip_addr);
-				sendbuf = packDNSPacket(result_packet, &sendbuflen);
-			}
-			break;
-		case ADDR_CACHED:
-			{
-				DNSPacket *result_packet = getDNSResult(recv_packet, ip_addr);
-				sendbuf = packDNSPacket(result_packet, &sendbuflen);
-			}
-			break;
-		case ADDR_NOT_FOUND:
-			{
-				int packet_length;
-				u_short p_id = assignNewID(recv_packet->p_header->h_id);
-				recv_packet->p_header->h_id  = p_id;
-				char* send_string = packDNSPacket(recv_packet, &packet_length);
-
-				//cout << "Start consulting Upper DNS" << endl;
-				iResult = sendto(upper_dns_socket, send_string, packet_length, 0, (struct sockaddr*)&servaddr,sizeof(servaddr));
-				if(iResult == SOCKET_ERROR)
-					printf("sendto() failed with error code : %d" , WSAGetLastError());
-
-				struct sockaddr_in sender_w;
-				int senderlen = sizeof(sender_w);
-				int err, sleeptime = 10;								
-
-				// wait_count serves as the implicator of total sleep time.
-				// Sleeping time starts from 10 milliseconds, and *2 each time.
-				// Maximum sleeping time = 10 + 20 + 40 + ... + 320 = 630ms
-				// If nothing's been received in max sleeping time, the packet is treated as lost.
-				// 
-				while(wait_count < 6)
-				{
-					sendbuflen = recv(upper_dns_socket, dnsbuf, DEFAULT_BUFLEN, 0);			//Try to receive some data
-					if(sendbuflen == SOCKET_ERROR)											//Perhaps no data received
-					{
-						err = WSAGetLastError();											//Find out error type: Wrong or No Data
-						if(err == WSAEWOULDBLOCK)											//Received no data, try again
-						{
-							wait_count++;													//
-							Sleep(sleeptime);
-							//cout << "Got no reply. Waiting time before retry(ms): " << sleeptime << endl;
-							sleeptime = sleeptime << 1;										//Multiply sleeptime by two
-							continue;
-						}
-						else																//Something has really gone wrong
-						{
-							printf("recvfrom_server() failed with error code : %d" , WSAGetLastError());
-							wait_count = 6;
-							break;
-						}
-					}
-					else
-					{
-						printf("Bytes received from 10.3.9.4: %d\n", sendbuflen);			//We received something.
-						//cout << "Get DNS Answer from 10.3.9.4" << endl;
-						p_id = getOriginalID(p_id);
-						*(u_short*)dnsbuf = htons(p_id);
-						sendbuf = dnsbuf;
-						break;
-					}
-				}
-			}
-			break;
-		}
-		if(wait_count == 6)
-		{
-			//cout << "Upper DNS timeout. Ignore current DNS request" << endl;
-			continue;
-		}
-		else
-		{
-			//cout << "Start sending result to client" << endl;
-			iResult = sendto(listen_socket, sendbuf, sendbuflen, 0, (struct sockaddr*)&clientaddr, client_addr_len);
-			if(iResult == SOCKET_ERROR)
-				printf("sendto() failed with error code : %d\n" , WSAGetLastError());
-			else
-				printf("Bytes send to 127.0.0.1: %d\n", iResult);
-		}
 	}while(iResult >= 0);
 
 	int s;
-	cin >> s;
+	std::cin >> s;
 	return 0;
 }
 
+/*Initalize WinSocket*/
 int startWSA()
 {
 	int iResult = 0;
@@ -190,8 +124,7 @@ int startWSA()
 	WSADATA wsaData;
 	iResult = WSAStartup(MAKEWORD(2,2), &wsaData);
     if (iResult != 0) {
-		//cout << "WSAStartup failed with error: " << iResult << endl;
-        return 255;
+		return 255;
     }
 	//cout << "WinSock Initialized." << endl;
 	return 0;
@@ -259,19 +192,49 @@ DNSQuery *fromDNSQuery(char *src, char **ret_ptr)
 	return new_q;
 }
 
-DNSResponse *fromDNSResponse(char* src, char **ret_ptr)
+DNSResponse *fromDNSResponse(char* src, char* head, char **ret_ptr)
 {
 	DNSResponse *new_r = new DNSResponse;
+	char *s = (char*)malloc(256 * sizeof(char));
 	int qname_length = 0;
+	char *final_name_dst = src;
+	bool name_jumped = false;
 
-	do
-		qname_length++;							//Get QueryName length
-	while(*(src + qname_length) != '\0');
-	char *s = (char*)malloc(qname_length * sizeof(char));
-	strcpy(s, src);
+	char *name_pointer = src;
+	while(1)
+	{
+		if(*name_pointer == '\0')
+		{
+			s[qname_length] = '\0';
+			if(name_jumped == false)
+				final_name_dst = src + qname_length;
+			break;
+		}
+		if(((*name_pointer) & 0xc0) == 0xc0)
+		{
+			int new_dst = htons(*((u_short*)name_pointer)) & 0x3f;
+			new_dst += (int)head;
+			name_jumped = true;
+			final_name_dst = name_pointer + 2;
+			name_pointer = (char*)new_dst;
+			continue;
+		}
+		if(*name_pointer < 20)
+		{
+			int tmp_len = *name_pointer++;
+			s[qname_length++] = tmp_len;
+			for(int i = 0; i < tmp_len; i++)
+				s[qname_length++] = *(name_pointer++);
+		}
+	}
+
+	//do
+	//	qname_length++;							//Get QueryName length
+	//while(*(src + qname_length) != '\0');
+		
 	new_r->r_name = s;
 	
-	src += qname_length;
+	src = final_name_dst;
 	u_short *tmp = (u_short*)src;
 	new_r->r_type = htons(*(tmp++));
 	new_r->r_class = htons(*(tmp++));
@@ -281,6 +244,7 @@ DNSResponse *fromDNSResponse(char* src, char **ret_ptr)
 
 	src = (char*)tmp;
 	s = (char*)malloc((new_r->r_rdlength + 1) * sizeof(char));
+	memcpy(s, src, new_r->r_rdlength);
 	s[new_r->r_rdlength] = '\0';
 	new_r->r_rdata = s;
 
@@ -398,7 +362,7 @@ int startDNSServer(SOCKET *ret_socket)
 	ListenSocket = socket(AF_INET, SOCK_DGRAM, 0);
 	if(ListenSocket == INVALID_SOCKET)
 	{
-		//cout << "Socket creation failed with error: " << iResult << endl;
+		std::cout << "Socket creation failed with error: " << iResult << std::endl;
 		WSACleanup();
 		return 1;
 	}
@@ -409,7 +373,7 @@ int startDNSServer(SOCKET *ret_socket)
 	hints.sin_addr.s_addr = INADDR_ANY;
 	hints.sin_port = htons(DNS_PORT);
 
-	iResult = bind(ListenSocket, (struct sockaddr*)&hints, sizeof(hints));
+	iResult = ::bind(ListenSocket, (struct sockaddr*)&hints, sizeof(hints));
 	if (iResult == SOCKET_ERROR) {
 		//cout << "Binding failed with error: " <<  iResult << endl;
 		WSACleanup();
@@ -421,7 +385,34 @@ int startDNSServer(SOCKET *ret_socket)
 	return 0;
 }
 
-int connectToUpperDNS(SOCKET *ret_socket)
+int bindSocket(SOCKET *ret_socket, struct sockaddr_in* servaddr)
+{
+	int iResult = 0;
+	SOCKET ListenSocket = INVALID_SOCKET;
+
+	//Create a new socket
+	ListenSocket = socket(AF_INET, SOCK_DGRAM, 0);
+	if(ListenSocket == INVALID_SOCKET)
+	{
+		std::cout << "Socket creation failed with error: " << iResult << std::endl;
+		WSACleanup();
+		return 1;
+	}
+	//cout << "Socket created." << endl;
+
+	iResult = ::bind(ListenSocket, (struct sockaddr*)servaddr, sizeof(*servaddr));
+	if (iResult == SOCKET_ERROR) {
+		std::cout << " !! Binding failed with error: " <<  iResult << std::endl;
+		WSACleanup();
+		return 1;
+	}
+	//cout << "Binding succeed." << endl;
+
+	*ret_socket = ListenSocket;
+	return 0;
+}
+
+int createUpperDNSSocket(SOCKET *ret_socket)
 {
 	int iResult;
 	SOCKET send_socket = INVALID_SOCKET;
@@ -437,15 +428,14 @@ int connectToUpperDNS(SOCKET *ret_socket)
 	}
 	//cout << "Socket created." << endl;
 
-	//Set socket mode: unblocked
-	iResult = ioctlsocket(send_socket,FIONBIO,(unsigned long *)&ul);			
-	if(iResult == SOCKET_ERROR)
-	{
-		//cout << "Socket mode changing failed. ERROR " << iResult << endl;
-		WSACleanup();
-		return 1;
-	}
-	//cout << "Socket mode changed to unblocked." << endl;
+	////Set socket mode: unblocked
+	//iResult = ioctlsocket(send_socket,FIONBIO,(unsigned long *)&ul);			
+	//if(iResult == SOCKET_ERROR)
+	//{
+	//	//cout << "Socket mode changing failed. ERROR " << iResult << endl;
+	//	WSACleanup();
+	//	return 1;
+	//}
 
 	//Return created socket
 	*ret_socket = send_socket;
@@ -463,9 +453,10 @@ void loadHosts()
 {
 	// Prepare reading
 	//cout << "Start loading DNSRelay." << endl;
-	ifstream fin;
-	fin.open(HOST_FILE_LOC, ios::in);
-	if(fin.is_open() == false){
+	std::ifstream fin;
+	fin.open(HOST_FILE_LOC, std::ios::in);
+	if(fin.is_open() == false)
+	{
 		//cout << "Failed to load DNSRelay file." << endl;
 		return;
 	}
@@ -493,29 +484,6 @@ void loadHosts()
 }
 
 /*
- * AssignNewID converts original packet ID to a new ID
- * to avoid sending requests with the same ID from different programs.
- * Original ID is stored in global variant id_list
- * The function stores original ID in the nth item of id_list
- * returns n, the newly assigned ID.
- */
-
-u_short assignNewID(u_short ori_id)
-{
-	static int assign_number = 1;
-	assign_number = (assign_number + 1) % 1000;
-	id_list[assign_number] = ori_id;
-	return assign_number;
-}
-
-u_short getOriginalID(u_short new_id)
-{
-	u_short ret_result = id_list[new_id];
-	id_list[new_id] = 0;
-	return ret_result;
-}
-
-/*
  * UnpackDNSPacket converts a RFC1305 DNS request string into DNSPacket struct
  * Since Unpack job currently only does with queries from the host,
  * This function only dispatch header and query part of a 
@@ -526,19 +494,36 @@ DNSPacket *unpackDNSPacket(char *buf)
 {
 	char *cur_ptr = buf, *ret_ptr;
 	
-	DNSPacket *req_packet = new DNSPacket;
+	DNSPacket *dns_packet = new DNSPacket;
 		
 	// Read DNS Header
-	req_packet->p_header = fromDNSHeader(cur_ptr, &ret_ptr);
+	dns_packet->p_header = fromDNSHeader(cur_ptr, &ret_ptr);
 	cur_ptr = ret_ptr;
 
 	// Read DNS Query
-	req_packet->p_qpointer = fromDNSQuery(cur_ptr, &ret_ptr);
-	cur_ptr = ret_ptr;
+	for(int i = 0; i < dns_packet->p_header->h_qdcount; i++)
+	{
+		dns_packet->p_qpointer[i] = fromDNSQuery(cur_ptr, &ret_ptr);
+		cur_ptr = ret_ptr;
+	}
 
-	req_packet->p_qr = Q_QUERY;
+	// Read DNS Response
+	if(dns_packet->p_header->h_ancount > 0)
+	{
+		dns_packet->p_rpointer[0] = fromDNSResponse(cur_ptr, buf, &ret_ptr);
+		cur_ptr = ret_ptr;
+		dns_packet->p_header->h_ancount = 1;
+	}
 
-	return req_packet;
+	//for(int i = 0; i < dns_packet->p_header->h_ancount; i++)
+	//{
+	//	dns_packet->p_rpointer[i] = fromDNSResponse(cur_ptr, buf, &ret_ptr);
+	//	cur_ptr = ret_ptr;
+	//}
+	//dns_packet->p_header->h_ancount = 1;
+	dns_packet->p_qr = (dns_packet->p_header->h_qr) ? Q_RESPONSE : Q_QUERY;
+	
+	return dns_packet;
 }
 
 /*
@@ -555,28 +540,289 @@ DNSPacket *unpackDNSPacket(char *buf)
 
 char *packDNSPacket(DNSPacket *packet, int *len)
 {
-	//cout << "Packing addr: " << packet->p_qpointer->q_qname << endl;
-	//cout << "Packing type: " << packet->p_qr << endl;
-	//cout << "Packing id:   " << packet->p_header->h_id << endl;
  	char *new_header = toDNSHeader(packet->p_header);
-	char *new_query = toDNSQuery(packet->p_qpointer);
 	
 	//Convert Query part and Header part
 	int tot_len = 0;
 	char *ret_string = new char[1024];
 	memcpy(ret_string, new_header, 12*sizeof(char));
 	tot_len += 12;
-	memcpy(ret_string+tot_len, new_query, strlen(packet->p_qpointer->q_qname) + 5);
-	tot_len +=  strlen(packet->p_qpointer->q_qname) + 5;
+	if(packet->p_header->h_qdcount == 1)
+	{
+		char *new_query = toDNSQuery(packet->p_qpointer[0]);
+		memcpy(ret_string+tot_len, new_query, strlen(packet->p_qpointer[0]->q_qname) + 5);
+		tot_len +=  strlen(packet->p_qpointer[0]->q_qname) + 5;
+	}
 
 	// Convert DNSResponse if needed (packet is a response)
-	if(packet->p_qr == Q_RESPONSE) 
+	if(packet->p_qr == Q_RESPONSE && packet->p_header->h_ancount>0) 
 	{
-		char *new_response = toDNSResponse(packet->p_rpointer);
-		memcpy(ret_string+tot_len, new_response, strlen(packet->p_rpointer->r_name) + 11 + packet->p_rpointer->r_rdlength);
-		tot_len += strlen(packet->p_rpointer->r_name) + 11 + packet->p_rpointer->r_rdlength;
+		char *new_response = toDNSResponse(packet->p_rpointer[0]);
+		memcpy(ret_string+tot_len, new_response, strlen(packet->p_rpointer[0]->r_name) + 11 + packet->p_rpointer[0]->r_rdlength);
+		tot_len += strlen(packet->p_rpointer[0]->r_name) + 11 + packet->p_rpointer[0]->r_rdlength;
 	}
 	*len = tot_len;
-	//cout << "Packing Complete" << endl;
 	return ret_string;
+}
+
+void DNSHandleThread(std::string upper_DNS_addr, SOCKET listen_socket, int t_id)
+{
+	THREADDEBUG << "Thread created." << std::endl;
+	char *sendbuf, *dnsbuf;
+	int sendbuflen = DEFAULT_BUFLEN;
+	int iResult = 0;
+	sendbuf = (char*)malloc(sendbuflen * sizeof(char));
+	dnsbuf  = (char*)malloc(DEFAULT_BUFLEN * sizeof(char));
+
+	//Create profile for upper DNS
+	struct sockaddr_in servaddr;
+	ZeroMemory(&servaddr, sizeof(servaddr));
+	servaddr.sin_family = AF_INET;
+	servaddr.sin_port = htons(DNS_PORT);
+	inet_pton(AF_INET, upper_DNS_addr.c_str(), &servaddr.sin_addr);
+
+	struct sockaddr_in myaddr;
+	ZeroMemory(&myaddr, sizeof(myaddr));
+	myaddr.sin_family = AF_INET;
+	myaddr.sin_addr.s_addr= htonl(INADDR_ANY);
+	myaddr.sin_port = htons(TOPORT(t_id));
+
+	// Initialize upper dns server
+	SOCKET upper_dns_socket = socket(AF_INET, SOCK_DGRAM, 0);
+	//if(createUpperDNSSocket(&upper_dns_socket) != 0)
+	//{
+	//	THREADDEBUG << "Upper DNS socket creation failed." << std::endl;
+	//	return;
+	//}
+	::bind(upper_dns_socket, (struct sockaddr*)&myaddr, sizeof(myaddr));
+
+	DWORD dwBytesReturned = 0;
+	BOOL bNewBehavior = FALSE;
+	DWORD status;
+	// disable  new behavior using
+	// IOCTL: SIO_UDP_CONNRESET
+	WSAIoctl(upper_dns_socket, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior),
+			NULL, 0, &dwBytesReturned, NULL, NULL);
+
+	std::thread return_thread = std::thread(DNSReturnThread,upper_dns_socket, listen_socket, t_id);
+
+	// Initialize cache list;
+	while(1)
+	{
+		DNSRequest *req = NULL;
+		while (req == NULL)
+		{
+			Sleep(20);
+			req = getDNSRequest();
+		}
+
+		THREADDEBUG << "Got DNSReq" << std::endl;
+		DNSPacket *recv_packet = req->packet;
+		
+		UINT32 ip_addr = 0;
+		int wait_count = 0;
+		WEBADDR_TYPE addr_type = getWebAddrType(recv_packet->p_qpointer[0]->q_qname, &ip_addr);
+		THREADDEBUG << "Search type finished, type: " << addr_type << std::endl;
+
+		if(recv_packet->p_qpointer[0]->q_qtype != 1) 
+		{
+			addr_type = ADDR_NOT_FOUND;
+		}
+		
+		switch((int)addr_type)
+		{
+		case ADDR_BLOCKED:
+		case ADDR_CACHED:
+			{
+				DNSPacket *result_packet = getDNSResult(recv_packet, ip_addr, addr_type);
+				result_packet->p_header->h_id = req->old_id;
+
+				sendbuf = packDNSPacket(result_packet, &sendbuflen);
+				THREADDEBUG << "Start sending result to client" << std::endl;
+				iResult = sendto(listen_socket, sendbuf, sendbuflen, 0, (struct sockaddr*)&(req->client_addr), req->client_addr_len);
+				if(iResult == SOCKET_ERROR)
+					THREADDEBUG << "sendto() failed with error code : " << WSAGetLastError() << std::endl;
+				else
+				{
+					THREADDEBUG << "Bytes send to 127.0.0.1: " << iResult << std::endl;
+				}
+				DNSRequest *waste = finishDNSRequest(req->new_id);
+			}
+				break;
+		case ADDR_NOT_FOUND:
+			{
+				int packet_length;
+				u_short p_id = req->new_id;
+				recv_packet->p_header->h_id  = p_id;
+				char* send_string = packDNSPacket(recv_packet, &packet_length);
+
+				THREADDEBUG << "Start consulting Upper DNS: " << upper_DNS_addr.c_str() << std::endl;
+				iResult = sendto(upper_dns_socket, send_string, packet_length, 0, (struct sockaddr*)&servaddr,sizeof(servaddr));
+				if(iResult == SOCKET_ERROR)
+					THREADDEBUG <<  "sendto() failed with error code : " << WSAGetLastError() << std::endl;
+			}
+			break;
+		}
+	}
+}
+
+void DNSReturnThread(SOCKET upper_dns_socket, SOCKET listen_socket, int t_id)
+{
+	int iResult = 0;
+	int sleeptime = 20, err = 0;
+	struct sockaddr_in servaddr;
+	int sendbuflen = DEFAULT_BUFLEN, dnsbuflen = DEFAULT_BUFLEN, servaddrlen = sizeof(servaddr);
+	char *dnsbuf = new char[DEFAULT_BUFLEN];
+
+	while(1)
+	{
+		iResult = recvfrom(upper_dns_socket, dnsbuf, DEFAULT_BUFLEN, 0, (struct sockaddr*)&servaddr, &servaddrlen); 			//Try to receive some data
+		if(iResult == SOCKET_ERROR)											//Perhaps no data received
+		{
+			err = WSAGetLastError();											//Find out error type: Wrong or No Data
+			if(err == WSAEWOULDBLOCK)											//Received no data, try again
+			{
+				Sleep(20);
+				continue;
+			}
+			else													//Something has really gone wrong
+			{
+				THREADDEBUG << "! recvfrom_server() failed with error code : " << WSAGetLastError() << std::endl;
+				break;
+			}
+		}
+		else
+		{
+			THREADDEBUG << "Bytes received from ***: " << iResult << std::endl;		//We received something.
+			//cout << "Get DNS Answer from 10.3.9.4" << endl;
+			//p_id = req->old_id;
+			int p_id = ntohs(*(u_short*)dnsbuf);
+			DNSRequest *req = finishDNSRequest(p_id);
+			*(u_short*)dnsbuf = htons(req->old_id);
+
+			THREADDEBUG << "Start sending result to client" << std::endl;
+			iResult = sendto(listen_socket, dnsbuf, sendbuflen, 0, (struct sockaddr*)&(req->client_addr), req->client_addr_len);
+			if(iResult == SOCKET_ERROR)
+				THREADDEBUG << "sendto() failed with error code : " << WSAGetLastError() << std::endl;
+			else
+			{
+				THREADDEBUG << "Bytes send to 127.0.0.1: " << iResult << std::endl;
+				analyzeResponsePacket(dnsbuf);
+			}
+		}
+	}
+}
+
+DNSRequest* finishDNSRequest(int new_id)
+{
+	DNSRequest* req;
+	pool_mutex.lock();
+	req = request_pool[new_id].req;
+	request_pool[new_id].available = true;
+	pool_mutex.unlock();
+	return req;
+}
+
+
+DNSRequest* getDNSRequest()
+{
+	DNSRequest* req = NULL;
+	if(pool_mutex.try_lock())
+	{
+		for(int i = 0; i < MAX_REQ; i++)
+		{
+			if(!request_pool[i].available)
+				if(request_pool[i].req->served == false)
+				{
+					req = request_pool[i].req;
+					request_pool[i].req->served = true;
+					break;
+				}
+		}
+		pool_mutex.unlock();
+	}
+	return req;
+}
+
+int addDNSRequestPool(DNSRequest *req)
+{
+	pool_mutex.lock();
+	int i;
+	for(i = 0; i < MAX_REQ; i++)
+	{
+		if(request_pool[i].available)
+		{
+			request_pool[i].available = false;
+			req->old_id = req->packet->p_header->h_id;
+			req->new_id = i;
+			request_pool[i].req = req;
+			break;
+		}
+	}
+	pool_mutex.unlock();
+	return i;
+}
+
+void flushDnsCacheThread()
+{
+	while(1)
+	{
+		Sleep(30000);
+		cache_mutex.lock();
+		int i; 
+		for(i = 0; i < cached_counter; i++)
+		{
+			if(cached_list[i]->occupied)
+				cached_list[i]->ttl -= 60;
+			if(cached_list[i]->ttl <= 0)
+				cached_list[i]->occupied = false;
+		}
+		cache_mutex.unlock();
+	}
+}
+
+void flushDNSRequestThread()
+{
+	while(1)
+	{
+		Sleep(10000);
+		pool_mutex.lock();
+		int i; 
+		for(i = 0; i < MAX_REQ; i++)
+		{
+			if(!request_pool[i].available)
+			{
+				if(request_pool[i].req->ttl > 0)
+					request_pool[i].req->ttl -= 100;
+				if(request_pool[i].req->ttl <= 0)
+					request_pool[i].available = true;
+			}
+		}
+		pool_mutex.unlock();
+	}
+}
+
+void analyzeResponsePacket(char *packet)
+{
+	DNSPacket *resp_packet = unpackDNSPacket(packet);
+	for(int i = 0; i < resp_packet->p_header->h_ancount; i++)
+	{
+		if(resp_packet->p_rpointer[i]->r_type != 1)
+			continue;
+		int count = 0;
+		
+		while(cached_list[cached_counter]->occupied)
+		{
+			cached_counter = (cached_counter + 1) % MAX_CACHED_ITEM;
+			count++;
+			if(count > 400) break;
+		}
+
+		cached_item *store_cache_loc = cached_list[cached_counter];
+		strcpy(store_cache_loc->webaddr, resp_packet->p_rpointer[i]->r_name);
+		store_cache_loc->occupied = true;
+		store_cache_loc->ttl = 600;
+		store_cache_loc->ip_addr = ntohl(*((UINT32*)resp_packet->p_rpointer[i]->r_rdata));
+		std::cout << "[CACHEADD]: Cache ID:" << cached_counter << std::endl;
+	}
 }

@@ -7,19 +7,27 @@
 #include <stdio.h>
 #include <iostream>
 #include <fstream>
+#include <thread>
+#include <mutex>
+#include <vector>
+#include <regex>
 #pragma comment (lib, "Ws2_32.lib")
 
 #define DNS_PORT 53				//DNS serves on port 53
 #define DEFAULT_BUFLEN 1024
 #define DNS_HEADER_LEN 12
 #define MAX_HOST_ITEM 1010
+#define MAX_CACHED_ITEM 300
+#define MAX_REQ 1000
 #define UPPER_DNS "10.3.9.4"
 #define HOST_FILE_LOC "C:\\dnsrelay.txt"
 #define BLOCKED_ADDR_IP "0.0.0.0"
 
 enum Query_QR {Q_QUERY = 0, Q_RESPONSE = 1};
-enum WEBADDR_TYPE {ADDR_BLOCKED = 100, ADDR_CACHED, ADDR_NOT_FOUND,};
+enum WEBADDR_TYPE {ADDR_BLOCKED = 100, ADDR_CACHED, ADDR_NOT_FOUND};
 enum PACKET_TYPE {SELF_CREATED_PACKET, UPPER_DNS_ANSWER};
+
+
 
 struct DnsHeader
 {
@@ -62,10 +70,29 @@ struct DnsPacket
 	PACKET_TYPE p_type;
 	Query_QR p_qr;
 	DNSHeader *p_header;
-	DNSQuery *p_qpointer;
-	DNSResponse *p_rpointer;
+	DNSQuery *p_qpointer[50];
+	DNSResponse *p_rpointer[50];
 };
 typedef struct DnsPacket DNSPacket;
+
+struct DnsRequest
+{
+	bool served;
+	int ttl;
+	int old_id;
+	int new_id;
+	DNSPacket *packet;
+	struct sockaddr_in client_addr;
+	int client_addr_len;
+};
+typedef struct DnsRequest DNSRequest;
+
+struct RequestPOOL
+{
+	bool available;
+	DNSRequest *req;
+};
+typedef struct RequestPOOL ReqPool;
 
 struct host_item_struct
 {
@@ -75,22 +102,36 @@ struct host_item_struct
 };
 typedef struct host_item_struct host_item;
 
+struct cached_item_struct
+{
+	bool occupied;
+	UINT32 ip_addr;
+	char* webaddr;
+	int ttl;
+};
+typedef struct cached_item_struct cached_item;
+
 // All functions are defined as below
 int startWSA();
 int startDNSServer(SOCKET *);
-int connectToUpperDNS(SOCKET *);
+int createUpperDNSSocket(SOCKET *);
+int bindSocket(SOCKET *ret_socket, struct sockaddr_in *servaddr);
 DNSHeader *fromDNSHeader(char*, char**);
 DNSQuery *fromDNSQuery(char*, char**);
-DNSResponse *fromDNSResponse(char*, char**);
+DNSResponse *fromDNSResponse(char*, char*, char**);
 char *toDNSHeader(DNSHeader*);
 char *toDNSQuery(DNSQuery*);
 char *toDNSResponse(DNSResponse*);
 void loadHosts();
-u_short assignNewID(u_short);
-u_short getOriginalID(u_short);
 DNSPacket *unpackDNSPacket(char *);
 char *packDNSPacket(DNSPacket *, int *);
-
-
+void DNSHandleThread(std::string, SOCKET, int);
+void DNSReturnThread(SOCKET, SOCKET, int);
+DNSRequest* getDNSRequest();
+int addDNSRequestPool(DNSRequest *);
+DNSRequest* finishDNSRequest(int);
+void flushDnsCacheThread();
+void flushDNSRequestThread();
+void analyzeResponsePacket(char*);
 
 #endif
